@@ -1,0 +1,11 @@
+node_modules
+dist
+logs/
+.vscode
+.env
+generated/*.ts
+!generated/.gitkeep
+generated/runs/
+generated/sites/
+generated/*.tmp
+crawler-state-*.json
