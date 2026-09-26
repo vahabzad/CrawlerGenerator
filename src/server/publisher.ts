@@ -12,7 +12,11 @@ export function siteSlug(value: string) {
 }
 
 export function isUsableArticle(article: Article) {
-  return Boolean(article.contentHtml && ((article.content?.length ?? 0) >= 120 || /<(?:img|video|audio|picture|source)\b/i.test(article.contentHtml)));
+  if (!article.contentHtml) return false;
+  if ((article.content?.length ?? 0) >= 120) return true;
+  if (/<(?:video|audio)\b/i.test(article.contentHtml)) return true;
+  const imageCount = article.contentHtml.match(/<(?:img|source)\b/gi)?.length ?? 0;
+  return imageCount >= 2 || (/\/(?:video|videos|audio)(?:\/|$)/i.test(new URL(article.url).pathname) && (Boolean(article.imageUrl) || imageCount > 0));
 }
 
 // Only schema-validated data from Codex is inserted into this reviewed runtime.
@@ -88,6 +92,7 @@ export function runnerSource(recipe: Recipe) {
     '    await save();',
     '    await new Promise(resolve=>setTimeout(resolve,350));',
     '  }',
+    '  if(args.includes("--all") && items.length+errors.length!==listing.length) throw new Error(`Full crawl accounting mismatch: discovered ${listing.length}, processed ${items.length+errors.length}`);',
     '  if (!args.includes("--all")) await writeFile(statePath,JSON.stringify([...new Set([...seen,...items.map(item=>item.url)])],null,2),"utf8");',
     '  result.status=errors.length?"partial":"completed"; await save();',
     '  log("output.saved","JSON output saved",{outputFile,extracted:items.length,failed:errors.length});',

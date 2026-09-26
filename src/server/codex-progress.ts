@@ -11,10 +11,27 @@ const labels: Record<string, string> = {
   todo_list: "به‌روزرسانی مراحل کار",
 };
 
-export async function consumeCodexEvents(events: AsyncIterable<ThreadEvent>, log: RunLogger): Promise<string> {
+export async function consumeCodexEvents(events: AsyncIterable<ThreadEvent>, log: RunLogger, completedMessageGraceMs = 5_000): Promise<string> {
   let response = "";
   let completed = false;
-  for await (const event of events) {
+  const iterator = events[Symbol.asyncIterator]();
+  while (true) {
+    const next = response
+      ? await Promise.race([
+        iterator.next(),
+        new Promise<{ done: true; value: undefined; inferred: true }>(resolve =>
+          setTimeout(() => resolve({ done: true, value: undefined, inferred: true }), completedMessageGraceMs),
+        ),
+      ])
+      : await iterator.next();
+    if ("inferred" in next) {
+      completed = true;
+      log.log("codex", "progress", "پاسخ کامل Codex دریافت شد؛ جریان رویداد بدون پیام پایان بسته نشد.", undefined, "warn");
+      void iterator.return?.();
+      break;
+    }
+    if (next.done) break;
+    const event = next.value;
     if (event.type === "thread.started") {
       log.log("codex", "progress", "نشست Codex آغاز شد.", { threadId: event.thread_id });
     } else if (event.type === "turn.started") {

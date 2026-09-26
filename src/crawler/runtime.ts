@@ -1,19 +1,38 @@
 import * as cheerio from "cheerio";
 import { chromium } from "playwright";
 import { lookup } from "node:dns/promises";
+import path from "node:path";
+import { tmpdir } from "node:os";
 import ipaddr from "ipaddr.js";
 import { decode } from "@msgpack/msgpack";
 import type { ApiEvidence, Article, Kind, Observer, Plan, Recipe, Snapshot } from "./recipe";
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const noop: Observer = () => {};
-const MAX_HTML = 4_000_000;
+// Keep the full document for extraction and coverage checks. Evidence sent to
+// Codex is bounded separately in server/evidence.ts.
+const MAX_HTML = 16_000_000;
+const TEMP_BROWSER_PROFILE = path.join(tmpdir(), "crawler-generator-browser-" + process.pid);
+const PUBLIC_DNS_TTL_MS = 5 * 60_000;
+const publicDnsCache = new Map<string, { expiresAt: number; addresses: Array<{ address: string }> }>();
 
 export async function assertPublicUrl(value: string) {
   const url = new URL(value);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("فقط URL عمومی HTTP/HTTPS بدون نام کاربری و رمز مجاز است.");
   const host = url.hostname.replace(/^\[|\]$/g, "");
-  const addresses = ipaddr.isValid(host) ? [{ address: host }] : await lookup(host, { all: true });
+  let addresses: Array<{ address: string }>;
+  if (ipaddr.isValid(host)) addresses = [{ address: host }];
+  else {
+    const cached = publicDnsCache.get(host);
+    if (cached && cached.expiresAt > Date.now()) addresses = cached.addresses;
+    else {
+      addresses = await lookup(host, { all: true });
+      // A complete crawl may fetch hundreds of pages from one host. Reusing a
+      // recently validated public answer prevents resolver throttling/sinkhole
+      // responses from turning the tail of that crawl into false SSRF errors.
+      publicDnsCache.set(host, { expiresAt: Date.now() + PUBLIC_DNS_TTL_MS, addresses });
+    }
+  }
   if (!addresses.length || addresses.some(({ address }) => {
     const parsed = ipaddr.process(address);
     return parsed.range() !== "unicast";
@@ -21,7 +40,7 @@ export async function assertPublicUrl(value: string) {
   return url;
 }
 
-async function limitedText(response: globalThis.Response, maximum: number) {
+export async function limitedText(response: globalThis.Response, maximum: number) {
   if (!response.body) return "";
   const reader = response.body.getReader();
   const buffers: Uint8Array[] = [];
@@ -30,9 +49,11 @@ async function limitedText(response: globalThis.Response, maximum: number) {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      total += value.length;
-      if (total > maximum) throw new Error("حجم پاسخ از حد مجاز بیشتر است.");
-      buffers.push(value);
+      const remaining = maximum - total;
+      if (remaining <= 0) break;
+      buffers.push(value.length > remaining ? value.subarray(0, remaining) : value);
+      total += Math.min(value.length, remaining);
+      if (value.length > remaining) break;
     }
     return Buffer.concat(buffers).toString("utf8");
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
@@ -151,6 +172,17 @@ function hasContentMedia(html: string | null): boolean {
   return $("img[src],video[src],video source[src],audio[src],audio source[src],picture source[src]").length > 0;
 }
 
+function hasStandaloneArticleMedia(article: Pick<Article, "url" | "contentHtml" | "imageUrl">): boolean {
+  if (!article.contentHtml) return false;
+  const $ = cheerio.load(article.contentHtml, null, false);
+  if ($("video[src],video source[src],audio[src],audio source[src]").length > 0) return true;
+  // A single hero/thumbnail image is not a complete article. Two or more
+  // images can represent a genuine photo story/gallery without long text.
+  if ($("img[src],picture source[src]").length >= 2) return true;
+  return /\/(?:video|videos|audio)(?:\/|$)/i.test(new URL(article.url).pathname)
+    && (Boolean(article.imageUrl) || $("img[src],picture source[src]").length > 0);
+}
+
 const persianMonths = ["فروردین","اردیبهشت","خرداد","تیر","مرداد","شهریور","مهر","آبان","آذر","دی","بهمن","اسفند"];
 function jalaliToGregorian(jy: number, jm: number, jd: number): [number, number, number] {
   jy += 1595;
@@ -200,7 +232,7 @@ export function normalizeTimestamp(value: string | null, now = new Date()): stri
 
 interface StructuredArticle {
   title: string | null; content: string | null; imageUrl: string | null; publishedAt: string | null;
-  author: string | null; categories: string[]; tags: string[];
+  author: string | null; categories: string[]; tags: string[]; mediaHtml: string | null;
 }
 function structuredArticle(snapshot: Snapshot): StructuredArticle {
   const $ = cheerio.load(snapshot.html);
@@ -217,11 +249,13 @@ function structuredArticle(snapshot: Snapshot): StructuredArticle {
     if (!value || typeof value !== "object") return;
     const record = value as Record<string, unknown>;
     const type = primitiveValues(record["@type"]).map(String);
-    if (type.some(item => /NewsArticle|Article|ReportageNewsArticle/i.test(item))) records.push(record);
+    if (type.some(item => /^(?:NewsArticle|Article|ReportageNewsArticle|VideoObject|AudioObject)$/i.test(item))) records.push(record);
     if (record["@graph"]) visit(record["@graph"]);
   };
   $("script[type='application/ld+json']").each((_, node) => { try { visit(JSON.parse($(node).text())); } catch { /* Invalid JSON-LD is ignored. */ } });
   const record = records[0] ?? {};
+  const recordTypes = primitiveValues(record["@type"]).map(String);
+  const mediaType = recordTypes.find(type => /^(?:VideoObject|AudioObject)$/i.test(type)) ?? null;
   const firstString = (value: unknown): string | null => {
     for (const item of primitiveValues(value)) {
       if (typeof item === "string" || typeof item === "number") return String(item).trim() || null;
@@ -238,13 +272,26 @@ function structuredArticle(snapshot: Snapshot): StructuredArticle {
   ))];
   const rawAuthor = firstString(record.author) ?? meta("meta[name='author']");
   const author = rawAuthor && !/^https?:\/\//i.test(rawAuthor) ? rawAuthor : null;
-  const image = firstString(record.image) ?? meta("meta[property='og:image']", "meta[name='twitter:image']");
+  const image = firstString(record.image ?? record.thumbnailUrl ?? record.thumbnail) ?? meta("meta[property='og:image']", "meta[name='twitter:image']");
+  const absoluteImage = absolute(image, snapshot.url);
+  const mediaUrl = absolute(firstString(record.contentUrl), snapshot.url);
+  const escapedAttribute = (value: string) => value.replace(/&/g, "&amp;").replace(/\"/g, "&quot;");
+  const mediaHtml = mediaType === "VideoObject" && mediaUrl
+    ? `<video controls${absoluteImage ? ` poster="${escapedAttribute(absoluteImage)}"` : ""}><source src="${escapedAttribute(mediaUrl)}"></video>`
+    : mediaType === "AudioObject" && mediaUrl
+      ? `<audio controls><source src="${escapedAttribute(mediaUrl)}"></audio>`
+      : mediaType && absoluteImage ? `<img src="${escapedAttribute(absoluteImage)}">` : null;
   return {
-    title: firstString(record.headline) ?? meta("meta[property='og:title']"),
-    content: firstString(record.articleBody), imageUrl: absolute(image, snapshot.url),
-    publishedAt: normalizeTimestamp(firstString(record.datePublished) ?? meta("meta[property='article:published_time']")),
-    author, categories: split(record.articleSection ?? meta("meta[property='article:section']")),
-    tags: split(record.keywords ?? meta("meta[name='keywords']", "meta[property='article:tag']")),
+    title: firstString(record.headline ?? record.name) ?? meta("meta[property='og:title']"),
+    content: firstString(record.articleBody ?? (mediaType ? record.description : null)), imageUrl: absoluteImage,
+    publishedAt: normalizeTimestamp(firstString(record.datePublished ?? record.uploadDate) ?? meta("meta[property='article:published_time']")),
+    author, categories: split(record.articleSection ?? meta(
+      "meta[property='article:section']",
+      "meta[property='cXenseParse:recs:section']",
+      "meta[name='page.subsection']",
+      "meta[name='page.section']",
+    )),
+    tags: split(record.keywords ?? meta("meta[name='keywords']", "meta[property='article:tag']")), mediaHtml,
   };
 }
 
@@ -311,6 +358,10 @@ export function extract(snapshot: Snapshot, plan: Plan, kind: Kind): Article[] {
     if (structured?.content && (!content || structured.content.length > content.length * 1.15)) {
       content = clean(structured.content); contentHtml = safeHtml(structured.content, snapshot.url);
     }
+    if (structured?.mediaHtml && (!contentHtml || ((content?.length ?? 0) < 120 && !hasContentMedia(contentHtml)))) {
+      const descriptionHtml = content ? safeHtml(content, snapshot.url) ?? "" : "";
+      contentHtml = safeHtml(descriptionHtml + structured.mediaHtml, snapshot.url);
+    }
     const plannedImage = absolute(field("imageUrl"), snapshot.url);
     let fallbackImage: string | null = null;
     let primaryImage: string | null = null;
@@ -336,7 +387,17 @@ export function extract(snapshot: Snapshot, plan: Plan, kind: Kind): Article[] {
       tags: [...new Set([...fields("tags"), ...(structured?.tags ?? [])])], author: structured?.author ?? field("author") ?? semanticAuthor,
     });
   }
-  return Array.from(new Map(items.map(item => [item.url, item])).values());
+  const unique = new Map<string, Article>();
+  for (const item of items) {
+    const current = unique.get(item.url);
+    // Selector unions can match overlapping article containers. Keep the
+    // richest extraction rather than whichever root happened to appear last.
+    const score = (candidate: Article) => (candidate.content?.length ?? 0)
+      + (candidate.contentHtml?.length ?? 0) / 20
+      + (hasStandaloneArticleMedia(candidate) ? 500 : 0);
+    if (!current || score(item) > score(current)) unique.set(item.url, item);
+  }
+  return [...unique.values()];
 }
 
 export function validateArticleQuality(article: Article, snapshot: Snapshot, plan: Plan) {
@@ -345,7 +406,7 @@ export function validateArticleQuality(article: Article, snapshot: Snapshot, pla
   const root = plan.mode === "html" || plan.mode === "rendered" ? $(plan.root).first() : null;
   const rootText = root?.length ? clean(root.html()) : null;
   const contentLength = article.content?.length ?? 0;
-  const hasMedia = hasContentMedia(article.contentHtml);
+  const hasMedia = hasStandaloneArticleMedia(article);
   const semanticRoot = Boolean(root?.is("article,main,[itemprop='articleBody']"));
   if (!hasMedia && semanticRoot && rootText && rootText.length >= 500 && contentLength < rootText.length * 0.35) {
     throw new Error(`متن خبر احتمالاً ناقص است: ${contentLength} نویسه از ${rootText.length} نویسهٔ بخش اصلی.`);
@@ -365,16 +426,15 @@ export function validateArticleQuality(article: Article, snapshot: Snapshot, pla
   if (structured.imageUrl && article.imageUrl !== structured.imageUrl) throw new Error("تصویر اصلی خبر با metadata صفحه تطابق ندارد.");
   if (structured.publishedAt && !article.publishedAt) throw new Error("تاریخ انتشار موجود در صفحه استخراج نشده است.");
   if (structured.author && !article.author) throw new Error("نویسندهٔ موجود در صفحه استخراج نشده است.");
+  if (structured.categories.length && !article.categories.length) throw new Error("دسته‌بندی موجود در صفحه استخراج نشده است.");
+  if (structured.tags.length && !article.tags.length) throw new Error("برچسب‌های موجود در صفحه استخراج نشده‌اند.");
   if (article.author && /^https?:\/\//i.test(article.author)) throw new Error("فیلد نویسنده به‌اشتباه URL است؛ نام نویسنده باید استخراج شود.");
-  if (plan.fields.imageUrl && !article.imageUrl) throw new Error("قاعدهٔ تصویر تعریف شده اما تصویر خبر استخراج نشده است.");
-  if (plan.fields.publishedAt && !article.publishedAt) throw new Error("قاعدهٔ تاریخ تعریف شده اما تاریخ به timestamp معتبر تبدیل نشده است.");
-  if (plan.fields.author && !article.author) throw new Error("قاعدهٔ نویسنده تعریف شده اما نام نویسنده استخراج نشده است.");
   return article;
 }
 
 export function validateItems(items: Article[], kind: Kind): Article[] {
   if (!items.length) throw new Error("استخراج " + (kind === "listing" ? "فهرست خبر" : "خبر") + " خالی است.");
-  if (kind === "article" && (!items[0].contentHtml || ((items[0].content?.length ?? 0) < 120 && !hasContentMedia(items[0].contentHtml)))) {
+  if (kind === "article" && (!items[0].contentHtml || ((items[0].content?.length ?? 0) < 120 && !hasStandaloneArticleMedia(items[0])))) {
     throw new Error("متن کامل یا محتوای تصویری خبر استخراج نشده است.");
   }
   return items;
@@ -389,19 +449,30 @@ export function htmlHasEvidence(snapshot: Snapshot, kind: Kind) {
       ($("h1").length > 0 && $("p").text().trim().length >= 120);
 }
 
+export function browserSnapshotLooksBlocked(snapshot: Snapshot) {
+  if (snapshot.html.length >= 2_000) return false;
+  return !htmlHasEvidence(snapshot, "listing") && !htmlHasEvidence(snapshot, "article");
+}
+
 export async function captureBrowser(
   value: string, signal: AbortSignal, waitMs = 15_000, observe: Observer = noop,
   until?: (snapshot: Snapshot) => boolean,
+  headless = true,
 ): Promise<Snapshot> {
   await assertPublicUrl(value); signal.throwIfAborted();
-  observe("browser", "مرورگر مستقل باز می‌شود؛ انتظار برای پاسخ APIها.");
-  const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : {}) });
-  const abort = () => { void browser.close().catch(() => {}); };
+  observe("browser", headless ? "مرورگر مستقل باز می‌شود؛ انتظار برای پاسخ APIها." : "سایت مرورگر headless را مسدود کرد؛ تلاش با Chrome عادی و محیط موقت انجام می‌شود.");
+  const launchOptions = { ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : {}) };
+  const browser = headless ? await chromium.launch({ headless: true, ...launchOptions }) : null;
+  const persistentContext = headless ? null : await chromium.launchPersistentContext(TEMP_BROWSER_PROFILE, {
+    headless: false, ...launchOptions, serviceWorkers: "block", acceptDownloads: false, locale: "en-GB",
+  });
+  const closeBrowser = () => persistentContext ? persistentContext.close() : browser!.close();
+  const abort = () => { void closeBrowser().catch(() => {}); };
   signal.addEventListener("abort", abort, { once: true });
   const pending = new Set<Promise<void>>();
   try {
     signal.throwIfAborted();
-    const context = await browser.newContext({ serviceWorkers: "block", acceptDownloads: false, locale: "fa-IR" });
+    const context = persistentContext ?? await browser!.newContext({ serviceWorkers: "block", acceptDownloads: false, locale: "en-GB" });
     // Fresh context: no user's cookies, profile, passwords or persisted credentials.
     await context.route("**/*", async route => {
       try {
@@ -452,24 +523,39 @@ export async function captureBrowser(
       if (["document", "xhr", "fetch"].includes(request.resourceType())) observe("browser", "یک درخواست صفحه ناموفق بود.", { resource: request.resourceType(), endpoint: request.url().split("?")[0] });
     });
     const response = await page.goto(value, { waitUntil: "domcontentloaded", timeout: 30_000 });
-    if (response && !response.ok()) throw new Error("مرورگر پاسخ HTTP " + response.status() + " دریافت کرد.");
+    if (response && !response.ok()) {
+      if (headless && [401, 403].includes(response.status())) {
+        closing = true;
+        page.off("response", onResponse);
+        await closeBrowser();
+        return await captureBrowser(value, signal, waitMs, observe, until, false);
+      }
+      throw new Error("مرورگر پاسخ HTTP " + response.status() + " دریافت کرد.");
+    }
     const deadline = Date.now() + waitMs;
     let snapshot: Snapshot = { url: page.url(), html: "", apis };
     while (Date.now() < deadline) {
       signal.throwIfAborted();
-      snapshot = { url: page.url(), html: (await page.content()).slice(0, MAX_HTML), apis: [...apis] };
-      if (until?.(snapshot)) break;
+      try {
+        snapshot = { url: page.url(), html: (await page.content()).slice(0, MAX_HTML), apis: [...apis] };
+        if (until?.(snapshot)) break;
+      } catch (error) {
+        observe("browser", "صفحه هنگام خواندن در حال تغییر مسیر بود؛ پس از پایدارشدن دوباره بررسی می‌شود.", { reason: error instanceof Error ? error.message : String(error) });
+      }
       await page.waitForTimeout(250);
     }
     // Response bodies still downloading are bounded by context closure below.
-    snapshot = { url: page.url(), html: (await page.content()).slice(0, MAX_HTML), apis: [...apis] };
+    try { snapshot = { url: page.url(), html: (await page.content()).slice(0, MAX_HTML), apis: [...apis] }; }
+    catch { /* Keep the most recent stable DOM captured in the loop. */ }
+    if (!snapshot.html) throw new Error("صفحهٔ مرورگر پیش از ثبت DOM پایدار چند بار تغییر مسیر داد.");
+    if (browserSnapshotLooksBlocked(snapshot)) throw new Error("مرورگر به‌جای محتوای سایت یک صفحهٔ خالی یا challenge ضدبات دریافت کرد؛ اجرا باید دوباره تلاش شود.");
     closing = true;
     page.off("response", onResponse);
     observe("browser", "بررسی صفحهٔ رندرشده پایان یافت.", { apiResponses: apis.length, htmlCharacters: snapshot.html.length });
     return snapshot;
   } finally {
     signal.removeEventListener("abort", abort);
-    await browser.close();
+    await closeBrowser().catch(() => {});
     await Promise.allSettled([...pending]);
   }
 }
@@ -487,9 +573,12 @@ export class RecipeCrawler {
       return items;
     };
     if (plan.mode === "html" || plan.mode === "embedded") {
-      const html = await this.io.html(url, signal, this.observe);
-      try { return validate(html); }
+      try {
+        const html = await this.io.html(url, signal, this.observe);
+        return validate(html);
+      }
       catch (error) {
+        signal.throwIfAborted();
         this.observe("fallback", "استخراج HTML کافی نبود؛ همان قواعد روی صفحهٔ رندرشده آزمایش می‌شوند.", { reason: error instanceof Error ? error.message : String(error) });
         const browser = await this.io.browser(url, signal, this.recipe.browserWaitMs, this.observe, snapshot => { try { validate(snapshot); return true; } catch { return false; } });
         return validate(browser);

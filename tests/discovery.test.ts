@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
-import { extract, validateItems, validateArticleQuality, assertPublicUrl, normalizeTimestamp, RecipeCrawler } from "../src/crawler/runtime";
+import { extract, validateItems, validateArticleQuality, assertPublicUrl, normalizeTimestamp, RecipeCrawler, limitedText, browserSnapshotLooksBlocked } from "../src/crawler/runtime";
 import { discoverExtractor, discoverNewsSitemap, expandListingCoverage, inferArticleUrlPattern, selectAuditUrls } from "../src/server/generator";
 import { isUsableArticle, runnerSource, siteSlug } from "../src/server/publisher";
 import { RunLogger } from "../src/server/logger";
@@ -42,6 +42,17 @@ test("an empty HTML shell falls back to captured APIs before asking Codex", asyn
     html: async () => shell, browser: async () => { captured = true; return browser; },
   });
   assert.equal(result.plan.mode, "api"); assert.equal(result.items.length, 2);
+  await log.flush();
+});
+test("an HTTP rejection from static fetch falls back to the browser during discovery", async t => {
+  const { log }=await setup(t);
+  let browserCalls=0;
+  const rendered={...shell,html:"<div class='news'><a href='/news/1'>First complete headline</a></div>"};
+  const result=await discoverExtractor("listing",shell.url,async()=>({...htmlPlan,mode:"rendered" as const}),log,new AbortController().signal,1000,{
+    html:async()=>{throw new Error("دریافت HTML ناموفق بود: HTTP 403");},
+    browser:async()=>{browserCalls++;return rendered;},
+  });
+  assert.equal(browserCalls,1); assert.equal(result.items.length,1);
   await log.flush();
 });
 test("a bad HTML extraction is repaired then falls back rather than publishing empty items", async t => {
@@ -94,6 +105,27 @@ test("image-only news preserves gallery media and passes article validation", ()
   assert.equal(validateArticleQuality(article,snapshot,plan),article);
 });
 
+test("a title and single hero image cannot pass as a complete text article", () => {
+  const article={url:"https://example.com/culture/article/story",title:"Feature title",content:"Photo credit",contentHtml:'<figure><img src="https://example.com/hero.jpg"></figure>',publishedAt:null,summary:null,imageUrl:"https://example.com/hero.jpg",categories:[],tags:[],author:null};
+  assert.throws(()=>validateItems([article],"article"),/متن کامل/);
+  assert.equal(isUsableArticle(article),false);
+});
+
+test("a short reel description with its verified poster remains valid multimedia", () => {
+  const article={url:"https://example.com/reel/video/p0video1/watch",title:"Video feature",content:"A concise description of this BBC video report.",contentHtml:"<p>A concise description of this BBC video report.</p>",publishedAt:null,summary:null,imageUrl:"https://example.com/poster.jpg",categories:[],tags:[],author:null};
+  assert.doesNotThrow(()=>validateItems([article],"article"));
+  assert.equal(isUsableArticle(article),true);
+});
+
+test("overlapping article roots retain the richest extraction", () => {
+  const full="Complete article paragraph with meaningful reporting. ".repeat(12);
+  const plan:Plan={mode:"html",root:"main, main article",responseUrlIncludes:null,urlPattern:null,explanation:"test",fields:{...fields,url:null,title:field("h1"),content:field("[data-component]")}};
+  const snapshot={...shell,url:"https://example.com/culture/article/story",html:`<main><h1>Feature title</h1><div data-component="text-block"><p>${full}</p></div><article><h1>Feature title</h1><div data-component="image-block"><img src="/hero.jpg"></div></article></main>`};
+  const article=validateItems(extract(snapshot,plan,"article"),"article")[0];
+  assert.match(article.content!,/Complete article paragraph/);
+  assert.ok(article.content!.length>500);
+});
+
 test("multimedia news with a short caption is not rejected as incomplete text", () => {
   const plan:Plan={mode:"html",root:"article",responseUrlIncludes:null,urlPattern:null,explanation:"test",fields:{...fields,url:null,title:field("h1"),content:field(".body")}};
   const snapshot={...shell,url:"https://example.com/news/video",html:`<article><h1>گزارش ویدیویی</h1><div class="body"><p>${"توضیح کوتاه ویدیو ".repeat(9)}</p><video src="/clip.mp4" controls></video></div><aside>${"متن جانبی ".repeat(100)}</aside></article>`};
@@ -126,6 +158,36 @@ test("quality validation rejects a selector that captures only a small part of t
   assert.throws(()=>validateArticleQuality(article,snapshot,plan),/ناقص/);
 });
 
+test("section metadata fills categories separately from topic tags", () => {
+  const full="Complete article body text for category validation. ".repeat(20);
+  const plan:Plan={mode:"html",root:"article",responseUrlIncludes:null,urlPattern:null,explanation:"test",fields:{...fields,url:null,title:field("h1"),content:field(".body")}};
+  const snapshot={...shell,url:"https://example.com/news/1",html:`<head><meta property="cXenseParse:recs:section" content="Technology"><meta name="keywords" content="Artificial intelligence, Data breaches"></head><article><h1>Technology report</h1><div class="body"><p>${full}</p></div></article>`};
+  const article=extract(snapshot,plan,"article")[0];
+  assert.deepEqual(article.categories,["Technology"]);
+  assert.deepEqual(article.tags,["Artificial intelligence","Data breaches"]);
+  assert.equal(validateArticleQuality(article,snapshot,plan),article);
+});
+
+test("quality validation rejects missing classification that exists in metadata", () => {
+  const full="Complete article body text for category validation. ".repeat(20);
+  const plan:Plan={mode:"html",root:"article",responseUrlIncludes:null,urlPattern:null,explanation:"test",fields:{...fields,url:null,title:field("h1"),content:field(".body")}};
+  const snapshot={...shell,url:"https://example.com/news/1",html:`<head><meta name="page.section" content="World"><meta name="keywords" content="Climate"></head><article><h1>World report</h1><div class="body"><p>${full}</p></div></article>`};
+  const article=extract(snapshot,plan,"article")[0];
+  assert.throws(()=>validateArticleQuality({...article,categories:[]},snapshot,plan),/دسته‌بندی/);
+  assert.throws(()=>validateArticleQuality({...article,tags:[]},snapshot,plan),/برچسب/);
+});
+
+test("structured video metadata keeps short video news as a valid media article", () => {
+  const plan:Plan={mode:"html",root:"html",responseUrlIncludes:null,urlPattern:null,explanation:"test",fields:{...fields,url:null,title:field(".text-article h1"),content:field(".text-article .body"),author:field(".text-article .author"),imageUrl:field(".text-article img","src")}};
+  const description="Persistent heavy downpours triggered widespread flooding and severe traffic disruption across the city.";
+  const snapshot={...shell,url:"https://example.com/video/newsfeed/2026/9/26/floods",html:`<head><script type="application/ld+json">${JSON.stringify({"@type":"VideoObject",name:"Flooding video report",uploadDate:"2026-09-26T04:43:39Z",description,thumbnailUrl:"/thumb.jpg"})}</script></head><body><main><h1>Flooding video report</h1></main></body>`};
+  const article=extract(snapshot,plan,"article")[0];
+  assert.equal(article.title,"Flooding video report"); assert.equal(article.content,description);
+  assert.equal(article.publishedAt,"2026-09-26T04:43:39.000Z"); assert.equal(article.imageUrl,"https://example.com/thumb.jpg");
+  assert.match(article.contentHtml!,/<img src="https:\/\/example.com\/thumb.jpg">/);
+  assert.equal(validateArticleQuality(article,snapshot,plan),article);
+});
+
 test("article structure validation ignores text blocks outside the selected body", () => {
   const plan:Plan={mode:"html",root:".page",responseUrlIncludes:null,urlPattern:null,explanation:"test",fields:{...fields,url:null,title:field("h1"),content:field(".body")}};
   const body=`<div class="body"><p>${"متن اصلی خبر ".repeat(20)}</p><p>${"ادامه خبر ".repeat(20)}</p></div>`;
@@ -147,6 +209,17 @@ test("standalone crawler falls back from an empty HTML shell to rendered content
   assert.equal(browserCalls,1); assert.match(article.content!,/fallback/); assert.match(article.contentHtml!,/<p>/);
 });
 
+test("standalone crawler falls back to rendered content when static fetch is forbidden", async () => {
+  const rendered={...shell,html:"<div class='news'><a href='/news/1'>First complete headline</a></div>"};
+  let browserCalls=0;
+  const crawler=new RecipeCrawler({listingUrl:shell.url,listing:htmlPlan,article:htmlPlan,browserWaitMs:1000},()=>{}, {
+    html:async()=>{throw new Error("HTTP 403");},
+    browser:async()=>{browserCalls++;return rendered;},
+  });
+  const items=await crawler.crawlListing(shell.url,new AbortController().signal);
+  assert.equal(browserCalls,1); assert.equal(items.length,1);
+});
+
 test("publication dates normalize to ISO timestamps and site folders use hostnames", () => {
   assert.equal(normalizeTimestamp("1725100000"),"2024-08-31T10:26:40.000Z");
   assert.equal(normalizeTimestamp("2026-08-31T10:00:00Z"),"2026-08-31T10:00:00.000Z");
@@ -155,6 +228,16 @@ test("publication dates normalize to ISO timestamps and site folders use hostnam
 });
 test("public URL guard rejects private IPv4 and mapped IPv6", async () => {
   for (const url of ["http://127.0.0.1","http://10.0.0.1","http://[::1]","http://[::ffff:127.0.0.1]","file:///tmp/test"]) await assert.rejects(assertPublicUrl(url));
+});
+test("responses above the HTML safety cap are truncated instead of aborting crawler generation", async () => {
+  const response = new Response("<main>" + "x".repeat(100) + "</main>");
+  const html = await limitedText(response, 32);
+  assert.equal(Buffer.byteLength(html), 32);
+  assert.match(html, /^<main>x+$/);
+});
+test("tiny anti-bot browser responses are rejected but sparse structured stories are retained", () => {
+  assert.equal(browserSnapshotLooksBlocked({...shell,html:"<html><body>Access denied</body></html>"}),true);
+  assert.equal(browserSnapshotLooksBlocked({...shell,html:`<script type="application/ld+json">${JSON.stringify({"@type":"VideoObject",name:"Video report",description:"A real structured video story"})}</script>`}),false);
 });
 test("emitted runner saves the entire list and more than ten articles, respecting seen URLs", async t => {
   const { directory } = await setup(t);
@@ -219,6 +302,48 @@ test("article URL shape expands a narrow widget to every news link on the page",
   assert.ok(expanded.items.every(item=>item.url.includes("/fa/news/")));
 });
 
+test("dated article slugs expand a narrow live-news widget to the complete page", () => {
+  const links=Array.from({length:30},(_,index)=>`<section class="${index<4?"ticker":"homepage-card"}"><a href="/en/${index%3===0?"europe":index%3===1?"americas":"live-news"}/20260926-story-${index}">Complete story headline ${index}</a></section>`).join("");
+  const snapshot:Snapshot={url:"https://www.france24.com/en/",html:links,apis:[]};
+  const narrow:Plan={...htmlPlan,root:".ticker",urlPattern:"^/en/(?:[^/]+)/[0-9]{8}-[^/]+$",fields:{...fields,url:field("a","href"),title:field("a")}};
+  const initial={plan:narrow,snapshot,items:validateItems(extract(snapshot,narrow,"listing"),"listing")};
+  assert.equal(initial.items.length,4);
+  assert.equal(inferArticleUrlPattern(initial.items[0].url,snapshot),"^/en/[^/]+/\\d{8}-[^/]+/?$");
+  const expanded=expandListingCoverage(initial,initial.items[0].url);
+  assert.equal(expanded.items.length,30); assert.equal(expanded.plan.root,"a[href]");
+});
+
+test("coverage census includes distinct article, reel video and audio route families", () => {
+  const links=[
+    ...Array.from({length:4},(_,i)=>`<a href="/news/articles/c12345${i}"><h2>Regular news headline ${i}</h2></a>`),
+    ...Array.from({length:3},(_,i)=>`<a href="/audio/play/p0audio${i}"><h2>Audio episode headline ${i}</h2></a>`),
+    ...Array.from({length:2},(_,i)=>`<a href="/reel/video/p0video${i}/watch"><h2>Video feature headline ${i}</h2></a>`),
+    `<a href="/newsletters"><h2>Newsletter promotion</h2></a><a href="/video/docs"><h2>Documentaries landing page</h2></a>`,
+  ].join("");
+  const snapshot:Snapshot={url:"https://www.bbc.com/",html:links,apis:[]};
+  const narrow:Plan={...htmlPlan,root:"a[href]",urlPattern:"^/news/articles/[a-z0-9]+$",fields:{...fields,url:field(".","href"),title:field(".")}};
+  const initial={plan:narrow,snapshot,items:validateItems(extract(snapshot,narrow,"listing"),"listing")};
+  const expanded=expandListingCoverage(initial,initial.items[0].url);
+  assert.equal(initial.items.length,4);
+  assert.equal(expanded.items.length,9);
+  assert.ok(expanded.items.some(item=>item.url.includes("/audio/play/")));
+  assert.ok(expanded.items.some(item=>item.url.includes("/reel/video/")));
+  assert.ok(!expanded.items.some(item=>item.url.endsWith("/newsletters")||item.url.endsWith("/video/docs")));
+});
+
+test("listing discovery rejects partial coverage and gives Codex the expected count", async t => {
+  const { log }=await setup(t);
+  const links=Array.from({length:30},(_,index)=>`<section class="${index<4?"ticker":"card"}"><a href="/en/${index%2?"world":"europe"}/20260926-story-${index}">Complete story headline ${index}</a></section>`).join("");
+  const snapshot:Snapshot={url:"https://example.com/en/",html:links,apis:[]};
+  const pattern="^/en/[^/]+/[0-9]{8}-[^/]+$";
+  const narrow:Plan={...htmlPlan,root:".ticker",urlPattern:pattern,fields:{...fields,url:field("a","href"),title:field("a")}};
+  const complete:Plan={...htmlPlan,root:"a[href]",urlPattern:pattern,fields:{...fields,url:field(".","href"),title:field(".")}};
+  const prompts:string[]=[];
+  const result=await discoverExtractor("listing",snapshot.url,async prompt=>{prompts.push(prompt);return prompts.length===1?narrow:complete;},log,new AbortController().signal,1000,{html:async()=>snapshot,browser:async()=>{throw new Error("browser should not be needed");}});
+  assert.equal(prompts.length,2); assert.match(prompts[1],/فقط 4 خبر از حداقل 30/); assert.equal(result.items.length,30);
+  await log.flush();
+});
+
 test("inferred wildcard article routes exclude taxonomy URLs and audits sample the full listing", () => {
   const links=["/writer/123456/article","/topic/123457/world","/hashtag/123458/news"].map((href,index)=>`<a href="${href}">عنوان ${index}</a>`).join("");
   const snapshot:Snapshot={url:"https://example.com/",html:links,apis:[]};
@@ -239,6 +364,24 @@ test("declared news sitemaps expand a homepage beyond its visible article anchor
   const result=await discoverNewsSitemap(origin+"/",log,new AbortController().signal,fetcher);
   assert.equal(result?.items.length,40); assert.equal(result?.snapshot.url,origin+"/news-sitemap.xml");
   assert.equal(result?.items[0].title,"Story 0"); assert.equal(result?.items[0].publishedAt,"2026-09-23T12:00:00.000Z");
+  await log.flush();
+});
+
+test("a generic sitemap index declared by robots discovers its nested news sitemap", async t => {
+  const { log }=await setup(t);
+  const origin="https://example.com";
+  const index=`<sitemapindex><sitemap><loc>${origin}/sitemap/pages.xml</loc></sitemap><sitemap><loc>${origin}/sitemap/sitemap-news.xml</loc></sitemap></sitemapindex>`;
+  const news=`<urlset xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">${Array.from({length:30},(_,index)=>`<url><loc>${origin}/story/story-${index}</loc><news:news><news:title>News ${index}</news:title></news:news></url>`).join("")}</urlset>`;
+  const calls:string[]=[];
+  const fetcher:typeof import("../src/crawler/runtime").fetchSnapshot=async url=>{
+    calls.push(url);
+    const html=url.endsWith("robots.txt")?`Sitemap: ${origin}/sitemap.xml`:url.endsWith("sitemap.xml")?index:url.endsWith("sitemap-news.xml")?news:"<urlset/>";
+    return {url,html,apis:[]};
+  };
+  const result=await discoverNewsSitemap(origin+"/",log,new AbortController().signal,fetcher);
+  assert.equal(result?.items.length,30);
+  assert.equal(result?.snapshot.url,origin+"/sitemap/sitemap-news.xml");
+  assert.ok(calls.includes(origin+"/sitemap.xml"));
   await log.flush();
 });
 

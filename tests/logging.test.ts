@@ -65,6 +65,30 @@ test("Codex fatal errors and premature stream close cannot appear as success", a
   await logger.flush();
 });
 
+test("Codex accepts a completed agent response when the SDK event stream never closes", async t => {
+  const { logger, entries } = await setup(t);
+  let returned = false;
+  const events: AsyncIterable<ThreadEvent> = {
+    [Symbol.asyncIterator]() {
+      let sent = false;
+      return {
+        next: async () => {
+          if (!sent) {
+            sent = true;
+            return { done: false as const, value: { type: "item.completed", item: { id: "answer", type: "agent_message", text: "usable-json" } } as ThreadEvent };
+          }
+          return await new Promise<IteratorResult<ThreadEvent>>(() => {});
+        },
+        return: async () => { returned = true; return { done: true as const, value: undefined }; },
+      };
+    },
+  };
+  assert.equal(await consumeCodexEvents(events, logger, 5), "usable-json");
+  assert.equal(returned, true);
+  assert.ok(entries.some(entry => entry.level === "warn" && entry.message.includes("بدون پیام پایان")));
+  await logger.flush();
+});
+
 function responseFor(content: string) {
   const bytes = new TextEncoder().encode(content);
   // Split every byte, including Persian multi-byte characters and JSON boundaries.

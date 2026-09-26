@@ -48,7 +48,9 @@ export function SiteDashboard() {
     } else { setSelected(null); setArticles(emptyArticles); }
   }
   useEffect(() => {
-    refresh().catch(error => setNotice(error instanceof Error ? error.message : "خطا در بارگذاری")).finally(() => setLoading(false));
+    refresh().catch(error => setNotice(error instanceof TypeError
+      ? "ارتباط با API برقرار نیست؛ فایل‌های کرالر حذف نشده‌اند. سرور را اجرا و دوباره تازه‌سازی کنید."
+      : error instanceof Error ? error.message : "خطا در بارگذاری")).finally(() => setLoading(false));
     return () => pending.current?.abort();
   }, []);
   useEffect(() => {
@@ -114,7 +116,9 @@ export function SiteDashboard() {
   return <section className="dashboard">
     <aside className="site-list card">
       <div className="section-title"><h2>سایت‌ها</h2><button className="secondary" type="button" onClick={() => void refresh()}>تازه‌سازی</button></div>
-      {!sites.length && <p className="hint">هنوز کرالر آزمایش‌شده‌ای ساخته نشده است.</p>}
+      {!sites.length && notice
+        ? <p className="result error" role="alert">{notice}</p>
+        : !sites.length && <p className="hint">هنوز کرالر آزمایش‌شده‌ای ساخته نشده است.</p>}
       {sites.map(site => <button type="button" key={site.id} className={`site-row ${selected?.id === site.id ? "active" : ""}`} onClick={() => void choose(site.id)}><strong>{site.id}</strong><span>{site.listingCount.toLocaleString("fa-IR")} لینک پیدا شده · {site.listingMode}</span></button>)}
     </aside>
     <div className="site-content">{selected ? <>
@@ -131,7 +135,7 @@ export function SiteDashboard() {
         <div className="section-title"><div><h2>اخبار استخراج‌شده</h2><p className="hint">برای دیدن متن کامل و مشخصات، روی هر خبر بزنید.</p></div><span className="status-pill">{articles.articles.length.toLocaleString("fa-IR")} خبر</span></div>
         {articleLoading && !articles.articles.length ? <p className="hint">در حال بارگذاری خبرها…</p> : !articles.articles.length ? <div className="empty-news"><p>هنوز اجرای کاملی برای این سایت وجود ندارد.</p><button disabled={busy} onClick={() => void runFull()}>اجرای کامل کرالر</button></div> : <div className="news-grid">{articles.articles.map(article => <button className="news-card" type="button" key={article.index + article.url} onClick={() => void openArticle(article)}>
           <div className="news-image">{article.imageUrl ? <img src={article.imageUrl} alt="" loading="lazy" onError={event => { event.currentTarget.style.display = "none"; }} /> : <span>بدون تصویر</span>}</div>
-          <div className="news-card-body"><h3>{article.title}</h3>{article.summary && <p>{article.summary}</p>}<div className="news-meta"><span>{article.author || "نویسنده نامشخص"}</span><time>{formatDate(article.publishedAt)}</time></div>{article.categories.length > 0 && <div className="chips">{article.categories.slice(0, 3).map(value => <span key={value}>{value}</span>)}</div>}</div>
+          <div className="news-card-body"><h3>{article.title}</h3>{article.summary && <p>{article.summary}</p>}<div className="news-meta"><span>{article.author || "نویسنده نامشخص"}</span><time>{formatDate(article.publishedAt)}</time></div>{(article.categories.length > 0 || article.tags.length > 0) && <div className="chips">{[...new Set([...article.categories, ...article.tags])].slice(0, 3).map(value => <span key={value}>{value}</span>)}</div>}</div>
         </button>)}</div>}
       </section>
       <section className="card chat-card">

@@ -53,20 +53,27 @@ async function outputSummaries(directory: string): Promise<SiteOutputSummary[]> 
     } catch { return { file, createdAt: "", status: "unreadable", mode: "unknown", discovered: 0, extracted: 0, failed: 0 }; }
   }));
 }
-function summarize(id: string, active: Awaited<ReturnType<typeof activeVersion>>, outputCount: number): SiteSummary {
+function summarize(id: string, active: Awaited<ReturnType<typeof activeVersion>>, outputs: SiteOutputSummary[]): SiteSummary {
+  const latestCompleteRun = outputs.find(output =>
+    ["all", "new"].includes(output.mode) && ["completed", "partial"].includes(output.status),
+  );
   return {
     id, listingUrl: active.recipe.listingUrl, version: active.version,
     updatedAt: active.version.replace(/-(\d{3})Z$/, ".$1Z").replace(/T(\d{2})-(\d{2})-(\d{2})/, "T$1:$2:$3"),
     listingMode: active.recipe.listing.mode, articleMode: active.recipe.article.mode,
     articlePattern: active.recipe.listing.urlPattern ?? null,
     verifiedArticles: active.sample.articles?.length ?? (active.sample.article ? 1 : 0),
-    listingCount: active.sample.listingCount ?? 0, outputCount,
+    // A generated sample is only a point-in-time snapshot. News sitemaps change
+    // continuously, so once a full run exists its discovered count is the only
+    // count that can be compared with the extracted and failed totals beside it.
+    listingCount: latestCompleteRun?.discovered ?? active.sample.listingCount ?? 0,
+    outputCount: outputs.length,
   };
 }
 export async function listSites(root: string): Promise<SiteSummary[]> {
   const ids = (await directories(sitesRoot(root))).filter(id => siteIdPattern.test(id));
   const sites = await Promise.all(ids.map(async id => {
-    try { const active = await activeVersion(root, id); const outputs = await outputSummaries(active.directory); return summarize(id, active, outputs.length); }
+    try { const active = await activeVersion(root, id); const outputs = await outputSummaries(active.directory); return summarize(id, active, outputs); }
     catch { return null; }
   }));
   return sites.filter((site): site is SiteSummary => Boolean(site)).sort((a, b) => b.version.localeCompare(a.version));
@@ -74,7 +81,7 @@ export async function listSites(root: string): Promise<SiteSummary[]> {
 export async function getSite(root: string, id: string): Promise<SiteDetails> {
   const active = await activeVersion(root, id);
   const outputs = await outputSummaries(active.directory);
-  return { ...summarize(id, active, outputs.length), sampleArticleUrl: active.sample.article?.url ?? active.sample.articles?.[0]?.url ?? null, outputs };
+  return { ...summarize(id, active, outputs), sampleArticleUrl: active.sample.article?.url ?? active.sample.articles?.[0]?.url ?? null, outputs };
 }
 export async function readSiteOutput(root: string, id: string, file: string) {
   if (!outputPattern.test(file)) throw new Error("نام فایل خروجی معتبر نیست.");
@@ -177,6 +184,9 @@ export async function runSiteFull(root: string, id: string, log: RunLogger, sign
         const result = JSON.parse(await readFile(outputFile, "utf8")) as { discovered?:number;items?:Article[];errors?:unknown[];status?:string;failure?:string };
         if (result.status === "failed") throw new Error(result.failure || "اجرای کامل کرالر ناموفق بود.");
         const summary = { discovered: result.discovered ?? 0, extracted: result.items?.length ?? 0, failed: result.errors?.length ?? 0, status: result.status ?? (code === 0 ? "completed" : "partial") };
+        if (summary.discovered !== summary.extracted + summary.failed) {
+          throw new Error(`آمار اجرای کامل ناسازگار است: ${summary.discovered} لینک کشف شد اما ${summary.extracted + summary.failed} لینک پردازش شد.`);
+        }
         if (code !== 0) log.log("site.run", "progress", "اجرا با چند خطای خبر پایان یافت؛ خبرهای موفق قابل مشاهده‌اند.", summary, "warn");
         resolve(summary);
       } catch (error) { reject(error); }

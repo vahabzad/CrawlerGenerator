@@ -18,7 +18,7 @@ test("site manager follows the published wrapper and rejects output traversal", 
       const directory = path.join(site, "versions", version);
       await mkdir(path.join(directory, "outputs"), { recursive: true });
       await writeFile(path.join(directory, "recipe.json"), JSON.stringify({ listingUrl: "https://example.com/news", listing: plan, article: { ...plan, urlPattern: null }, browserWaitMs: 1000 }));
-      await writeFile(path.join(directory, "sample.json"), JSON.stringify({ listingCount: version === active ? 12 : 99, articles: [{ url: "https://example.com/news/1" }] }));
+      await writeFile(path.join(directory, "sample.json"), JSON.stringify({ listingCount: version === active ? 15 : 99, articles: [{ url: "https://example.com/news/1" }] }));
     }
     await writeFile(path.join(site, "crawler.ts"), `export * from "./versions/${active}/crawler";`);
     const output = "2026-09-01T03-00-00-000Z-12345678-1234-1234-1234-123456789abc.json";
@@ -26,6 +26,8 @@ test("site manager follows the published wrapper and rejects output traversal", 
     await writeFile(path.join(site, "versions", active, "outputs", output), JSON.stringify({ crawledAt: "2026-09-01T03:00:00.000Z", status: "completed", mode: "all", discovered: 12, items: [article], errors: [] }));
     const sites = await listSites(root);
     assert.equal(sites.length, 1);
+    // Counts shown beside extracted/failed totals must come from the same full
+    // run, not the older generation-time sample.
     assert.equal(sites[0].listingCount, 12);
     const details = await getSite(root, "example-com");
     assert.equal(details.version, active);
