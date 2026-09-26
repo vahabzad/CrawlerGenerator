@@ -6,8 +6,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { extract, validateItems, validateArticleQuality, assertPublicUrl, normalizeTimestamp, RecipeCrawler } from "../src/crawler/runtime";
-import { discoverExtractor, expandListingCoverage, inferArticleUrlPattern } from "../src/server/generator";
-import { runnerSource, siteSlug } from "../src/server/publisher";
+import { discoverExtractor, discoverNewsSitemap, expandListingCoverage, inferArticleUrlPattern, selectAuditUrls } from "../src/server/generator";
+import { isUsableArticle, runnerSource, siteSlug } from "../src/server/publisher";
 import { RunLogger } from "../src/server/logger";
 import type { Plan, Snapshot } from "../src/crawler/recipe";
 
@@ -82,6 +82,26 @@ test("article output preserves safe HTML links/images and separates metadata arr
   assert.equal(validateArticleQuality(article,snapshot,plan),article);
 });
 
+test("image-only news preserves gallery media and passes article validation", () => {
+  const plan: Plan = { mode:"html",root:"article",responseUrlIncludes:null,urlPattern:null,explanation:"test",fields:{
+    ...fields,url:null,title:field("h1"),content:field(".gallery img"),imageUrl:null,
+  }};
+  const snapshot={...shell,url:"https://example.com/news/gallery",html:`<article><h1>گزارش تصویری روز</h1><div class="gallery"><img src="/one.jpg"><img data-src="/two.jpg"></div></article>`};
+  const article=validateItems(extract(snapshot,plan,"article"),"article")[0];
+  assert.equal(article.content,null);
+  assert.match(article.contentHtml!,/src="https:\/\/example.com\/one.jpg"/);
+  assert.match(article.contentHtml!,/src="https:\/\/example.com\/two.jpg"/);
+  assert.equal(validateArticleQuality(article,snapshot,plan),article);
+});
+
+test("multimedia news with a short caption is not rejected as incomplete text", () => {
+  const plan:Plan={mode:"html",root:"article",responseUrlIncludes:null,urlPattern:null,explanation:"test",fields:{...fields,url:null,title:field("h1"),content:field(".body")}};
+  const snapshot={...shell,url:"https://example.com/news/video",html:`<article><h1>گزارش ویدیویی</h1><div class="body"><p>${"توضیح کوتاه ویدیو ".repeat(9)}</p><video src="/clip.mp4" controls></video></div><aside>${"متن جانبی ".repeat(100)}</aside></article>`};
+  const article=extract(snapshot,plan,"article")[0];
+  assert.match(article.contentHtml!,/<video/); assert.equal(validateArticleQuality(article,snapshot,plan),article);
+  assert.equal(isUsableArticle(article),true);
+});
+
 test("structured article metadata overrides a wrong image and fills publication fields", () => {
   const full="متن کامل و معتبر خبر ".repeat(30);
   const plan:Plan={mode:"html",root:"article",responseUrlIncludes:null,urlPattern:null,explanation:"test",fields:{...fields,url:null,title:field("h1"),content:field(".body"),imageUrl:field(".wrong","src")}};
@@ -104,6 +124,15 @@ test("quality validation rejects a selector that captures only a small part of t
   const snapshot={...shell,url:"https://example.com/news/1",html:`<article><h1>عنوان خبر</h1><div class="first">${"ابتدای خبر ".repeat(15)}</div><div>${"ادامه کامل خبر ".repeat(100)}</div></article>`};
   const article=extract(snapshot,plan,"article")[0];
   assert.throws(()=>validateArticleQuality(article,snapshot,plan),/ناقص/);
+});
+
+test("article structure validation ignores text blocks outside the selected body", () => {
+  const plan:Plan={mode:"html",root:".page",responseUrlIncludes:null,urlPattern:null,explanation:"test",fields:{...fields,url:null,title:field("h1"),content:field(".body")}};
+  const body=`<div class="body"><p>${"متن اصلی خبر ".repeat(20)}</p><p>${"ادامه خبر ".repeat(20)}</p></div>`;
+  const sidebar=Array.from({length:7},(_,i)=>`<p>مطلب جانبی شماره ${i} با متن کافی</p>`).join("");
+  const snapshot={...shell,url:"https://example.com/news/1",html:`<div class="page"><h1>عنوان خبر</h1>${body}<aside>${sidebar}</aside></div>`};
+  const article=extract(snapshot,plan,"article")[0];
+  assert.equal(validateArticleQuality(article,snapshot,plan),article);
 });
 
 test("standalone crawler falls back from an empty HTML shell to rendered content", async () => {
@@ -157,6 +186,21 @@ test("emitted runner saves the entire list and more than ten articles, respectin
   assert.equal((await readdir(path.join(directory,"outputs"))).length,3);
 });
 
+test("emitted runner merges listing snapshots and retries transient article failures", async t => {
+  const { directory } = await setup(t);
+  await writeFile(path.join(directory,"package.json"),'{"type":"module"}');
+  await writeFile(path.join(directory,"crawler.ts"),runnerSource({listingUrl:shell.url,listing:htmlPlan,article:htmlPlan,browserWaitMs:1000}));
+  await writeFile(path.join(directory,"runtime.ts"),[
+    'let attempts=0,listingAttempts=0;',
+    'export class RecipeCrawler {',
+    'async crawlListing(){listingAttempts++;return listingAttempts===1?[{url:"https://example.com/news/1",title:"خبر ۱"}]:[{url:"https://example.com/news/1",title:"خبر ۱"},{url:"https://example.com/news/2",title:"خبر ۲"}]}',
+    'async crawlArticle(url){attempts++;if(attempts===1)throw new Error("متن کامل یا محتوای تصویری خبر استخراج نشده است.");if(attempts===2)throw new Error("net::ERR_CONNECTION_RESET");return {url,title:"خبر",content:"متن کامل خبر"}}',
+    '}',
+  ].join("\n"));
+  const result=JSON.parse((await promisify(execFile)(process.execPath,["--import",import.meta.resolve("tsx"),path.join(directory,"crawler.ts"),"--all"],{cwd:directory,windowsHide:true})).stdout);
+  assert.equal(result.listing.length,2); assert.equal(result.items.length,2); assert.equal(result.errors.length,0); assert.equal(result.status,"completed");
+});
+
 test("all matching listing cards are retained beyond the previous 500-card cap", () => {
   const html=Array.from({length:501},(_,i)=>`<div class="news"><a href="/news/${i}">News item ${i}</a></div>`).join("");
   assert.equal(extract({...shell,html},htmlPlan,"listing").length,501);
@@ -173,6 +217,29 @@ test("article URL shape expands a narrow widget to every news link on the page",
   const expanded=expandListingCoverage(initial,"https://www.yjc.ir/fa/news/9000000/sample-0");
   assert.equal(expanded.items.length,225); assert.equal(expanded.plan.root,"a[href]");
   assert.ok(expanded.items.every(item=>item.url.includes("/fa/news/")));
+});
+
+test("inferred wildcard article routes exclude taxonomy URLs and audits sample the full listing", () => {
+  const links=["/writer/123456/article","/topic/123457/world","/hashtag/123458/news"].map((href,index)=>`<a href="${href}">عنوان ${index}</a>`).join("");
+  const snapshot:Snapshot={url:"https://example.com/",html:links,apis:[]};
+  const pattern=inferArticleUrlPattern("https://example.com/writer/123456/article",snapshot)!;
+  assert.match("/writer/123456/article",new RegExp(pattern));
+  assert.doesNotMatch("/topic/123457/world",new RegExp(pattern));
+  assert.doesNotMatch("/hashtag/123458/news",new RegExp(pattern));
+  const items=Array.from({length:40},(_,index)=>({url:`https://example.com/writer/${100000+index}`,title:index===31?"گزارش ویدیویی":"خبر عادی",content:null,contentHtml:null,publishedAt:null,summary:null,imageUrl:null,categories:[],tags:[],author:null}));
+  const audit=selectAuditUrls(items,items[0].url,8);
+  assert.equal(audit.length,8); assert.ok(audit.includes(items[31].url)); assert.ok(audit.some(url=>Number(url.split("/").pop())>100020));
+});
+
+test("declared news sitemaps expand a homepage beyond its visible article anchors", async t => {
+  const { log }=await setup(t);
+  const origin="https://example.com";
+  const xml=`<urlset xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">${Array.from({length:40},(_,index)=>`<url><loc>${origin}/news/2026/9/23/story-${index}</loc><lastmod>2026-09-23T12:${String(index).padStart(2,"0")}:00Z</lastmod><news:news><news:title>Story ${index}</news:title></news:news></url>`).join("")}</urlset>`;
+  const fetcher:typeof import("../src/crawler/runtime").fetchSnapshot=async url=>({url,html:url.endsWith("robots.txt")?`Sitemap: ${origin}/news-sitemap.xml`:xml,apis:[]});
+  const result=await discoverNewsSitemap(origin+"/",log,new AbortController().signal,fetcher);
+  assert.equal(result?.items.length,40); assert.equal(result?.snapshot.url,origin+"/news-sitemap.xml");
+  assert.equal(result?.items[0].title,"Story 0"); assert.equal(result?.items[0].publishedAt,"2026-09-23T12:00:00.000Z");
+  await log.flush();
 });
 
 test("partial and fatal failures keep diagnostic JSON and do not mark failed URLs seen", async t => {

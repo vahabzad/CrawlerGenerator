@@ -142,7 +142,13 @@ function safeHtml(value: unknown, base: string): string | null {
     }).filter(Boolean).join(", "));
   });
   const html = $.html().trim();
-  return clean(html) ? html : null;
+  return clean(html) || hasContentMedia(html) ? html : null;
+}
+
+function hasContentMedia(html: string | null): boolean {
+  if (!html) return false;
+  const $ = cheerio.load(html, null, false);
+  return $("img[src],video[src],video source[src],audio[src],audio source[src],picture source[src]").length > 0;
 }
 
 const persianMonths = ["فروردین","اردیبهشت","خرداد","تیر","مرداد","شهریور","مهر","آبان","آذر","دی","بهمن","اسفند"];
@@ -338,13 +344,21 @@ export function validateArticleQuality(article: Article, snapshot: Snapshot, pla
   const $ = cheerio.load(snapshot.html);
   const root = plan.mode === "html" || plan.mode === "rendered" ? $(plan.root).first() : null;
   const rootText = root?.length ? clean(root.html()) : null;
-  if (rootText && rootText.length >= 500 && article.content!.length < rootText.length * 0.35) {
-    throw new Error(`متن خبر احتمالاً ناقص است: ${article.content!.length} نویسه از ${rootText.length} نویسهٔ بخش اصلی.`);
+  const contentLength = article.content?.length ?? 0;
+  const hasMedia = hasContentMedia(article.contentHtml);
+  const semanticRoot = Boolean(root?.is("article,main,[itemprop='articleBody']"));
+  if (!hasMedia && semanticRoot && rootText && rootText.length >= 500 && contentLength < rootText.length * 0.35) {
+    throw new Error(`متن خبر احتمالاً ناقص است: ${contentLength} نویسه از ${rootText.length} نویسهٔ بخش اصلی.`);
   }
   const html = cheerio.load(article.contentHtml!, null, false);
-  const sourceBlocks = root?.find("p,li,h2,h3,blockquote").filter((_, node) => $(node).text().trim().length >= 20).length ?? 0;
-  const extractedBlocks = html("p,li,h2,h3,blockquote").filter((_, node) => html(node).text().trim().length >= 20).length;
-  if (sourceBlocks >= 3 && extractedBlocks < Math.ceil(sourceBlocks * 0.6)) {
+  const blockSelector = "p,li,h2,h3,blockquote";
+  const selectedContent = root && plan.fields.content?.path ? root.find(plan.fields.content.path) : root;
+  const sourceBlocks = selectedContent
+    ? selectedContent.filter(blockSelector).filter((_, node) => $(node).text().trim().length >= 20).length
+      + selectedContent.find(blockSelector).filter((_, node) => $(node).text().trim().length >= 20).length
+    : 0;
+  const extractedBlocks = html(blockSelector).filter((_, node) => html(node).text().trim().length >= 20).length;
+  if (!hasMedia && sourceBlocks >= 3 && extractedBlocks < Math.ceil(sourceBlocks * 0.6)) {
     throw new Error(`ساختار HTML خبر ناقص است: ${extractedBlocks} بخش از ${sourceBlocks} بخش متنی.`);
   }
   const structured = structuredArticle(snapshot);
@@ -360,8 +374,8 @@ export function validateArticleQuality(article: Article, snapshot: Snapshot, pla
 
 export function validateItems(items: Article[], kind: Kind): Article[] {
   if (!items.length) throw new Error("استخراج " + (kind === "listing" ? "فهرست خبر" : "خبر") + " خالی است.");
-  if (kind === "article" && (!items[0].content || items[0].content.length < 120 || !items[0].contentHtml)) {
-    throw new Error("متن کامل و HTML خبر استخراج نشده یا متن کمتر از ۱۲۰ نویسه است.");
+  if (kind === "article" && (!items[0].contentHtml || ((items[0].content?.length ?? 0) < 120 && !hasContentMedia(items[0].contentHtml)))) {
+    throw new Error("متن کامل یا محتوای تصویری خبر استخراج نشده است.");
   }
   return items;
 }

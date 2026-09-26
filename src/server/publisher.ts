@@ -11,6 +11,10 @@ export function siteSlug(value: string) {
   return hostname.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "news-site";
 }
 
+export function isUsableArticle(article: Article) {
+  return Boolean(article.contentHtml && ((article.content?.length ?? 0) >= 120 || /<(?:img|video|audio|picture|source)\b/i.test(article.contentHtml)));
+}
+
 // Only schema-validated data from Codex is inserted into this reviewed runtime.
 export function runnerSource(recipe: Recipe) {
   return [
@@ -25,6 +29,27 @@ export function runnerSource(recipe: Recipe) {
     'const crawler = new RecipeCrawler(recipe, log);',
     'export async function crawlListing(url = recipe.listingUrl) { return crawler.crawlListing(url); }',
     'export async function crawlArticle(url: string) { return crawler.crawlArticle(url); }',
+    'async function crawlCompleteListing(url: string, attempts = 3) {',
+    '  const merged=new Map<string,Article>(); let lastError:unknown;',
+    '  for(let attempt=1;attempt<=attempts;attempt++){',
+    '    try{for(const item of await crawlListing(url))merged.set(item.url,item);}catch(error){lastError=error;log("listing.retry","Listing snapshot failed; retrying",{url,attempt,message:error instanceof Error?error.message:String(error)});}',
+    '    if(attempt<attempts)await new Promise(resolve=>setTimeout(resolve,250));',
+    '  }',
+    '  if(merged.size)return [...merged.values()];',
+    '  throw lastError instanceof Error?lastError:new Error("Listing extraction failed after retries");',
+    '}',
+    'async function crawlArticleWithRetry(url: string, attempts = 3) {',
+    '  for(let attempt=1;attempt<=attempts;attempt++){',
+    '    try{return await crawlArticle(url);}catch(error){',
+    '      const message=error instanceof Error?error.message:String(error);',
+    '      const retryable=/timeout|timed out|ERR_CONNECTION|ECONN|fetch failed|network|socket|متن کامل یا محتوای تصویری خبر استخراج نشده|عنوان خبر استخراج نشده|ساختار HTML خبر ناقص است|متن خبر احتمالاً ناقص است/i.test(message);',
+    '      if(!retryable||attempt===attempts)throw error;',
+    '      log("article.retry","Transient article extraction error; retrying article",{url,attempt,nextAttempt:attempt+1,message:message.split(/\\r?\\n/)[0].slice(0,500)});',
+    '      await new Promise(resolve=>setTimeout(resolve,1500*attempt));',
+    '    }',
+    '  }',
+    '  throw new Error("Article retry loop ended unexpectedly");',
+    '}',
     'export async function main() {',
     '  const args = process.argv.slice(2);',
     '  if (args.includes("--help")) { console.log("Usage: tsx crawler.ts [listing-url] [--all] [--verify] [--verify-count=1..10] [--state=path] [--output=path]"); return; }',
@@ -37,13 +62,13 @@ export function runnerSource(recipe: Recipe) {
     '  const save = () => writeFile(outputFile,JSON.stringify(result,null,2),"utf8");',
     '  log("output.created","JSON output file created",{outputFile});',
     '  try {',
-    '  const listing = await crawlListing(sourceUrl);',
+    '  const listing = await crawlCompleteListing(sourceUrl);',
     '  result.listing=listing; result.discovered=listing.length; await save();',
     '  if (args.includes("--verify")) {',
     '    const requested=Number(args.find(a=>a.startsWith("--verify-count="))?.slice(15) || 1);',
     '    if(!Number.isInteger(requested)||requested<1||requested>10) throw new Error("--verify-count must be between 1 and 10");',
     '    const targets=listing.slice(0,Math.min(requested,listing.length)); const articles:Article[]=[];',
-    '    for(const [index,item] of targets.entries()){log("verify.article","Verifying article",{current:index+1,total:targets.length,url:item.url});articles.push(await crawlArticle(item.url));}',
+    '    for(const [index,item] of targets.entries()){log("verify.article","Verifying article",{current:index+1,total:targets.length,url:item.url});articles.push(await crawlArticleWithRetry(item.url));}',
     '    const article=articles[0];',
     '    Object.assign(result,{listingCount:listing.length,article,articles,items:articles,status:"completed"}); await save();',
     '    log("output.saved","JSON output saved",{outputFile}); console.log(JSON.stringify(result,null,2)); return;',
@@ -58,7 +83,7 @@ export function runnerSource(recipe: Recipe) {
     '  result.skippedSeen=listing.length-unseen.length;',
     '  const {items,errors}=result; await save();',
     '  for (const item of unseen) {',
-    '    try { log("article.start","Extracting article",{url:item.url,current:items.length+errors.length+1,total:unseen.length}); items.push(await crawlArticle(item.url)); }',
+    '    try { log("article.start","Extracting article",{url:item.url,current:items.length+errors.length+1,total:unseen.length}); items.push(await crawlArticleWithRetry(item.url)); }',
     '    catch(error) { const message=error instanceof Error?error.message:"Unknown error"; errors.push({url:item.url,message}); log("article.error",message,{url:item.url}); }',
     '    await save();',
     '    await new Promise(resolve=>setTimeout(resolve,350));',
@@ -102,8 +127,8 @@ export async function publishBundle(root: string, recipe: Recipe, log: RunLogger
         cwd: root, signal, timeout: 180_000, maxBuffer: 2_000_000, windowsHide: true,
       });
       const result = JSON.parse(stdout) as { listingCount: number; article: Article; articles: Article[] };
-      if (!result.listingCount || !result.articles?.length || result.articles.some(article => !article.content || article.content.length < 120 || !article.contentHtml)) throw new Error("فایل تولیدشده همهٔ خبرهای آزمایشی را معتبر استخراج نکرد.");
-      log.log("verify.live", "progress", "فایل مستقل با موفقیت روی چند خبر آزمایش شد.", { listingCount: result.listingCount, verifiedArticles: result.articles.length, minimumContentCharacters: Math.min(...result.articles.map(article => article.content!.length)) });
+      if (!result.listingCount || !result.articles?.length || result.articles.some(article => !isUsableArticle(article))) throw new Error("فایل تولیدشده همهٔ خبرهای آزمایشی را معتبر استخراج نکرد.");
+      log.log("verify.live", "progress", "فایل مستقل با موفقیت روی چند خبر آزمایش شد.", { listingCount: result.listingCount, verifiedArticles: result.articles.length, minimumContentCharacters: Math.min(...result.articles.map(article => article.content?.length ?? 0)) });
       return result;
     } catch (error) {
       // Child errors can contain huge stdout/stderr; keep only a bounded diagnostic tail.

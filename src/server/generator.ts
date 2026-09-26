@@ -19,6 +19,57 @@ export interface DiscoveryIO {
   browser: typeof captureBrowser;
 }
 
+const NON_ARTICLE_ROUTE_PREFIXES = ["topic", "topics", "tag", "tags", "hashtag", "category", "categories", "section", "sections", "search", "showcase"];
+
+const sitemapField = (path: string) => ({ path, attribute: null, template: null });
+const sitemapPlan: Plan = {
+  mode: "html", root: "url", responseUrlIncludes: null, urlPattern: null,
+  fields: {
+    url: sitemapField("loc"), title: sitemapField("news\\:title"), publishedAt: sitemapField("lastmod"),
+    summary: null, content: null, imageUrl: sitemapField("image\\:loc"), categories: null, tags: null, author: null,
+  },
+  explanation: "Public news sitemap entries declared by the site, ordered by their supplied update timestamps.",
+};
+
+function comparableHostname(value: string) {
+  return new URL(value).hostname.toLowerCase().replace(/^www\./, "");
+}
+
+export async function discoverNewsSitemap(
+  listingUrl: string, log: RunLogger, signal: AbortSignal,
+  fetcher: typeof fetchSnapshot = fetchSnapshot,
+): Promise<DesignResult | null> {
+  const page = new URL(listingUrl);
+  if (!/^\/(?:news|latest)?\/?$/i.test(page.pathname)) return null;
+  const observe = (stage: string, message: string, details?: Record<string, unknown>) => log.log("listing.sitemap." + stage, "progress", message, details);
+  const candidates = new Set<string>([new URL("/news-sitemap.xml", page.origin).href]);
+  try {
+    const robotsUrl = new URL("/robots.txt", page.origin).href;
+    const robots = await fetcher(robotsUrl, signal, observe);
+    for (const match of robots.html.matchAll(/^\s*Sitemap:\s*(\S+)\s*$/gim)) {
+      const candidate = new URL(match[1], robotsUrl);
+      if (comparableHostname(candidate.href) !== comparableHostname(listingUrl)) continue;
+      if (/news|article-new/i.test(candidate.pathname)) candidates.add(candidate.href);
+    }
+  } catch (error) {
+    log.log("listing.sitemap", "progress", "فایل robots برای کشف sitemap خبری قابل استفاده نبود.", errorDetails(error), "warn");
+  }
+  let best: DesignResult | null = null;
+  for (const candidate of [...candidates].slice(0, 8)) {
+    signal.throwIfAborted();
+    try {
+      const snapshot = await fetcher(candidate, signal, observe);
+      const items = validateItems(extract(snapshot, sitemapPlan, "listing"), "listing")
+        .filter(item => comparableHostname(item.url) === comparableHostname(listingUrl));
+      if (items.length >= 20 && (!best || items.length > best.items.length)) best = { plan: sitemapPlan, snapshot, items };
+      log.log("listing.sitemap", "progress", "sitemap خبری بررسی شد.", { url: candidate, articleCount: items.length });
+    } catch (error) {
+      log.log("listing.sitemap", "progress", "این sitemap خبری قابل استفاده نبود.", { url: candidate, ...errorDetails(error) }, "warn");
+    }
+  }
+  return best;
+}
+
 export function inferArticleUrlPattern(articleUrl: string, snapshot: Snapshot): string | null {
   const sample = new URL(articleUrl, snapshot.url);
   if (sample.hostname !== new URL(snapshot.url).hostname) return null;
@@ -41,7 +92,31 @@ export function inferArticleUrlPattern(articleUrl: string, snapshot: Snapshot): 
     const sampleShare = values.filter(value => value === segment).length / Math.max(1, values.length);
     return candidates.length >= 2 && sampleShare >= 0.8 ? escape(segment) : "[^/]+";
   });
-  return "^/" + [...prefix, idExpression].join("/") + "(?:/[^/]+)*/?$";
+  const firstSegmentGuard = prefix[0] === "[^/]+"
+    ? "(?!(?:" + NON_ARTICLE_ROUTE_PREFIXES.join("|") + ")(?:/|$))"
+    : "";
+  return "^/" + firstSegmentGuard + [...prefix, idExpression].join("/") + "(?:/[^/]+)*/?$";
+}
+
+export function selectAuditUrls(items: Article[], articleUrl: string, limit = 8): string[] {
+  const unique = [...new Map([articleUrl, ...items.map(item => item.url)].map(url => [url, url])).values()];
+  if (unique.length <= limit) return unique;
+  const chosen: string[] = [articleUrl];
+  const mediaTerms = /video|photo|gallery|watch|podcast|live|وید[ئی]و|فیلم|تصویر|عکس|گزارش تصویری|صوت/i;
+  for (const item of items) {
+    if (chosen.length >= limit || !mediaTerms.test(`${item.title} ${item.summary ?? ""} ${item.url}`)) continue;
+    if (!chosen.includes(item.url)) chosen.push(item.url);
+  }
+  for (let slot = 0; chosen.length < limit && slot < limit * 2; slot++) {
+    const index = Math.round(slot * (items.length - 1) / Math.max(1, limit * 2 - 1));
+    const url = items[index]?.url;
+    if (url && !chosen.includes(url)) chosen.push(url);
+  }
+  for (const url of unique) {
+    if (chosen.length >= limit) break;
+    if (!chosen.includes(url)) chosen.push(url);
+  }
+  return chosen.slice(0, limit);
 }
 
 export function expandListingCoverage(result: DesignResult, articleUrl: string, log?: RunLogger): DesignResult {
@@ -75,12 +150,12 @@ function instructions(kind: Kind, phase: "html" | "browser", snapshot: Snapshot,
       "Prefer mode api when a captured decoded API response contains the news data. Otherwise rendered HTML (mode rendered) or structured scripts created by the browser (mode browser-embedded) are allowed. Never use mode embedded in browser phase; that mode fetches raw HTML.",
     "mode html/rendered: root is a CSS selector for each news card or ONE article container. Field path is a CSS selector RELATIVE TO ROOT ('.' means root). attribute is href/src/content/datetime or null to read content. Do not select all navigation links as news.",
     "mode api/embedded: root is a dot JSON path into each matching response, e.g. data.news.* or data.article or $ for entire object. * traverses arrays. Field path is relative to each root. JSON key names must be exact. No JSONPath filters, brackets, recursive .., or executable code. Embedded source identifiers are supplied; responseUrlIncludes chooses a captured endpoint (origin+pathname), not a query string or temporary id.",
-    "For listing, select the actual latest-news list, excluding related stories/navigation/featured-only lists when possible. url and title are required. Select imageUrl from the real image attribute (including lazy-load attributes such as data-src when needed). Article requires title and the complete body in content (not the lead/summary) with at least 120 characters. The runtime stores BOTH cleaned text and sanitized contentHtml from this one content selector; therefore select the whole article-body container or every body paragraph so links, images, lists, headings and formatting are retained.",
+    "For listing, select the actual latest-news list, excluding related stories/navigation/featured-only lists when possible. url and title are required. Select imageUrl from the real image attribute (including lazy-load attributes such as data-src when needed). Article requires title and the complete body in content (not the lead/summary). Text articles need at least 120 characters; photo, video and audio stories may instead be valid when content selects their meaningful img/video/audio/picture/source elements. The runtime stores BOTH cleaned text and sanitized contentHtml from this one content selector; therefore select the whole article-body container or every body/media block so links, images, video, audio, lists, headings and formatting are retained.",
     "Metadata contract applies to every generated crawler: publishedAt must point to the most precise publication date/time available and the runtime converts it to an ISO-8601 timestamp; never invent a date. author is the byline/name only. categories selects category/topic elements. tags selects tag/keyword elements. categories and tags become separate deduplicated string arrays, so use a selector/path returning individual values, not a parent whose combined sentence merges them. Optional metadata may be null only when it is genuinely absent from the evidence.",
     "Selectors must be reusable across different articles on the site. Prefer semantic attributes, itemprop, stable structural wrappers and descriptive utility classes. Avoid opaque generated/hash classes such as n-xxxxxx, nth-child/nth-of-type tied to one article, exact transient class combinations, :has conditions on generated classes, and assumptions that the first/second content block is always the body. The content selector must collect ALL body blocks while excluding lead, related-news, sharing, tags and comments by positive stable structure whenever possible.",
     "Field template may construct a URL ONLY using observed URL patterns, e.g. {origin}/news/{id}/{slug}. Template placeholders read relative JSON fields and are percent-encoded; {value} reads path+attribute, {pageUrl} and {origin} are special. Keep template null for direct URL fields. Never embed a fixed sample article id, URL, headline, or content. Infer detail links from real anchors in evidence, not assumptions.",
     "If an array contains body paragraphs, use a field path like paragraphs.*.text; strings are joined. HTML strings in JSON fields are cleaned to text by the runtime. Preserve dates as supplied.",
-    "urlPattern must exist (null for article detail; for listing use it when a reliable article URL shape is known). All field objects have path, attribute, template; all fields url,title,publishedAt,summary,content,imageUrl,categories,tags,author must exist (null allowed). Keep article root narrow. For listing coverage, a[href] with urlPattern is preferable when news links are spread across multiple page sections.",
+    "urlPattern must exist (null for article detail; for listing use it when a reliable article URL shape is known). It must reject taxonomy, topic, tag, category, section, profile, search and navigation routes even when they contain a numeric id shaped like an article. All field objects have path, attribute, template; all fields url,title,publishedAt,summary,content,imageUrl,categories,tags,author must exist (null allowed). Keep article root narrow. For listing coverage, a[href] with urlPattern is preferable when news links are spread across multiple page sections. Article selectors must work across the site's observed variants such as standard text, opinion, user posts, galleries, video/audio and live pages rather than only the first sample.",
     previousError ? "Previous extraction failed in the actual runtime. Fix this error: " + previousError : "",
     "Evidence follows (samples are truncated; array paths correspond to the full live data):",
     evidence(snapshot),
@@ -147,21 +222,32 @@ export async function generateRecipe(options: GenerationOptions, log: RunLogger,
   };
   let listing = await discoverExtractor("listing", options.listingUrl, propose, log, signal, options.browserWaitMs, undefined, options.articleUrl, options.feedback);
   listing = expandListingCoverage(listing, options.articleUrl || listing.items[0].url, log);
+  const sitemapListing = await discoverNewsSitemap(options.listingUrl, log, signal);
+  if (sitemapListing && sitemapListing.items.length > listing.items.length * 1.25) {
+    log.log("listing.sitemap", "progress", "پوشش sitemap خبری از صفحهٔ ورودی کامل‌تر است و به‌عنوان فهرست اصلی انتخاب شد.", {
+      pageArticles: listing.items.length, sitemapArticles: sitemapListing.items.length, sitemapUrl: sitemapListing.snapshot.url,
+    });
+    listing = sitemapListing;
+  }
+  const effectiveListingUrl = listing.snapshot.url;
   const articleUrl = options.articleUrl || listing.items[0].url;
   await assertPublicUrl(articleUrl);
   log.log("article.select", "progress", options.articleUrl ? "خبر نمونهٔ واردشده انتخاب شد." : "یک خبر از فهرست استخراج‌شده انتخاب شد.", { articleUrl });
   let article = await discoverExtractor("article", articleUrl, propose, log, signal, options.browserWaitMs, undefined, undefined, options.feedback);
-  const auditUrls = [...new Set([articleUrl, ...listing.items.map(item => item.url)])].slice(0, 3);
+  const auditUrls = selectAuditUrls(listing.items, articleUrl);
+  const repairHistory: Array<{ plan: Plan; passedUrls: string[]; failedUrl: string; reason: string }> = [];
   for (let round = 1; round <= 3; round++) {
-    const recipe: Recipe = { listingUrl: options.listingUrl, listing: listing.plan, article: article.plan, browserWaitMs: options.browserWaitMs };
+    const recipe: Recipe = { listingUrl: effectiveListingUrl, listing: listing.plan, article: article.plan, browserWaitMs: options.browserWaitMs };
     const crawler = new RecipeCrawler(recipe, (stage, message, details) => log.log("article.audit." + stage, "progress", message, details));
     let failure: { url: string; message: string } | null = null;
+    const passedUrls: string[] = [];
     await log.stage("article.audit", `کنترل کیفیت قواعد روی چند خبر — نوبت ${round}`, async () => {
       for (const [index, url] of auditUrls.entries()) {
         signal.throwIfAborted();
         log.log("article.audit", "progress", "آزمایش قواعد روی خبر مستقل", { current: index + 1, total: auditUrls.length, url });
         try {
           const result = await crawler.crawlArticle(url, signal);
+          passedUrls.push(url);
           log.log("article.audit", "progress", "خبر مستقل معتبر بود.", { current: index + 1, contentCharacters: result.content?.length ?? 0, hasImage: Boolean(result.imageUrl), hasPublishedAt: Boolean(result.publishedAt), hasAuthor: Boolean(result.author) });
         } catch (error) {
           failure = { url, message: error instanceof Error ? error.message : String(error) };
@@ -174,8 +260,20 @@ export async function generateRecipe(options: GenerationOptions, log: RunLogger,
     if (!failed) break;
     if (round === 3) throw new StageError("article.audit", "قواعد جزئیات پس از سه نوبت اصلاح روی چند خبر پایدار نشد؛ کرالر منتشر نشد.");
     log.log("article.repair", "progress", "خبر ناموفق برای اصلاح دوبارهٔ قواعد به Codex داده می‌شود.", { round, url: failed.url, reason: failed.message });
-    article = await discoverExtractor("article", failed.url, propose, log, signal, options.browserWaitMs, undefined, undefined, options.feedback);
+    repairHistory.push({ plan: article.plan, passedUrls, failedUrl: failed.url, reason: failed.message });
+    const compatibilityContext = [
+      options.feedback ?? "",
+      "This is a compatibility repair, not a replacement for one page variant. Produce ONE reusable plan that keeps every previously successful article variant working while adding the failing variant. For HTML selectors, comma-separated selector unions and a shared stable root are allowed. Do not merely replace the previous selectors with selectors specific to the failing page.",
+      ...repairHistory.map((entry, index) => [
+        `Repair history ${index + 1}:`,
+        `Previously successful URLs: ${entry.passedUrls.join(", ") || "none before the failure"}`,
+        `Failing URL: ${entry.failedUrl}`,
+        `Failure: ${entry.reason}`,
+        `Previous plan that must remain supported: ${JSON.stringify(entry.plan)}`,
+      ].join("\n")),
+    ].filter(Boolean).join("\n\n");
+    article = await discoverExtractor("article", failed.url, propose, log, signal, options.browserWaitMs, undefined, undefined, compatibilityContext);
   }
-  const recipe: Recipe = { listingUrl: options.listingUrl, listing: listing.plan, article: article.plan, browserWaitMs: options.browserWaitMs };
+  const recipe: Recipe = { listingUrl: effectiveListingUrl, listing: listing.plan, article: article.plan, browserWaitMs: options.browserWaitMs };
   return recipe;
 }
